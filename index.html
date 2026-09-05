@@ -476,6 +476,11 @@ let satkerList = [];
 let lastProcessDate = "";
 
 const DEFAULT_GSHEET_URL = "https://docs.google.com/spreadsheets/d/1W0Q5ciBSGLmVgEwqwI-wLyr5zb3a9jeqW2pN5qqTV8Y/edit?usp=drive_link";
+// Google Apps Script untuk mengambil tanggal terakhir modifikasi Google Drive.
+// Setelah deploy Apps Script sebagai Web App, masukkan URL /exec di bawah.
+const DRIVE_METADATA_API_URL = "https://script.google.com/macros/s/AKfycbx74VwVW1HzZVqPGYIDiTaKoMOg8TQuEDU1uJdzKPRoA68HA4nkwNOcbSxsFyCRyL_X-A/exec";
+const DRIVE_SPREADSHEET_ID = "1W0Q5ciBSGLmVgEwqwI-wLyr5zb3a9jeqW2pN5qqTV8Y";
+
 
 function parseNipNrp(raw) {
     let clean = (raw || "").toString().replace(/'/g, '').replace(/\s/g, '').trim();
@@ -2208,10 +2213,15 @@ function processWorkbook(wb, source) {
 
     localStorage.setItem('pegawaiData', JSON.stringify(pegawai));
 
-    lastProcessDate = new Date().toLocaleString('id-ID', {
-        weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit'
-    }) + (source ? " — sumber: " + source : "");
-    localStorage.setItem('lastProcessDate', lastProcessDate);
+    // Untuk Google Sheets, tanggal ditentukan dari metadata Google Drive,
+    // bukan dari waktu browser memproses data.
+    if (source !== "Google Sheets") {
+        lastProcessDate = new Date().toLocaleString('id-ID', {
+            weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+            hour: '2-digit', minute: '2-digit'
+        }) + (source ? " — sumber: " + source : "");
+        localStorage.setItem('lastProcessDate', lastProcessDate);
+    }
 
     generateListOrder();
     generateTableSelectors();
@@ -2252,6 +2262,92 @@ function normalizeGSheetCsvUrl(url) {
     }
 }
 
+function loadDriveLastModified() {
+    if (!DRIVE_METADATA_API_URL ||
+        DRIVE_METADATA_API_URL === "GANTI_DENGAN_URL_WEB_APP_APPS_SCRIPT") {
+        console.warn("URL Google Apps Script belum diatur.");
+        return Promise.resolve(false);
+    }
+
+    return new Promise((resolve) => {
+        const callbackName =
+            "__driveMetadataCallback_" + Date.now() + "_" +
+            Math.random().toString(36).slice(2);
+
+        const script = document.createElement("script");
+        const timeout = setTimeout(() => {
+            cleanup();
+            console.warn("Timeout mengambil metadata Google Drive.");
+            resolve(false);
+        }, 15000);
+
+        function cleanup() {
+            clearTimeout(timeout);
+            try { delete window[callbackName]; } catch (e) {}
+            if (script.parentNode) script.parentNode.removeChild(script);
+        }
+
+        window[callbackName] = function(data) {
+            cleanup();
+
+            if (!data || !data.success || !data.file) {
+                console.warn(
+                    "Metadata Google Drive tidak tersedia:",
+                    data && data.message ? data.message : data
+                );
+                resolve(false);
+                return;
+            }
+
+            const modifiedDate = new Date(data.file.modifiedTime);
+
+            if (Number.isNaN(modifiedDate.getTime())) {
+                console.warn("Tanggal modifikasi Google Drive tidak valid.");
+                resolve(false);
+                return;
+            }
+
+            lastProcessDate = modifiedDate.toLocaleString("id-ID", {
+                weekday: "long",
+                year: "numeric",
+                month: "long",
+                day: "numeric",
+                hour: "2-digit",
+                minute: "2-digit"
+            }) + " — sumber: Google Drive";
+
+            localStorage.setItem("lastProcessDate", lastProcessDate);
+            localStorage.setItem("driveFileName", data.file.name || "");
+            localStorage.setItem("driveModifiedTime", data.file.modifiedTime || "");
+
+            updateHeaderDate();
+
+            console.log(
+                "Google Drive:",
+                data.file.name,
+                "terakhir dimodifikasi:",
+                lastProcessDate
+            );
+
+            resolve(true);
+        };
+
+        script.onerror = function() {
+            cleanup();
+            console.warn("Gagal menghubungi Google Apps Script.");
+            resolve(false);
+        };
+
+        script.src =
+            DRIVE_METADATA_API_URL +
+            "?fileId=" + encodeURIComponent(DRIVE_SPREADSHEET_ID) +
+            "&callback=" + encodeURIComponent(callbackName) +
+            "&_=" + Date.now();
+
+        document.head.appendChild(script);
+    });
+}
+
 function loadFromGSheet(manual) {
     if (!gsheetCsvUrl) {
         if (manual) alert('Link Google Sheets belum diisi.');
@@ -2277,8 +2373,33 @@ function loadFromGSheet(manual) {
             }
             let wb = XLSX.read(csvText, { type: 'string' });
             processWorkbook(wb, "Google Sheets");
-            setGSheetStatus('✅ Data berhasil dimuat dari Google Sheets. ' + lastProcessDate, '#217346');
-            if (manual) alert('Data berhasil dimuat dari Google Sheets!');
+
+            // Ambil tanggal terakhir modifikasi dari metadata Google Drive.
+            loadDriveLastModified().then((metadataLoaded) => {
+                if (metadataLoaded) {
+                    setGSheetStatus(
+                        '✅ Data berhasil dimuat dari Google Sheets. ' +
+                        lastProcessDate,
+                        '#217346'
+                    );
+                } else {
+                    setGSheetStatus(
+                        '✅ Data berhasil dimuat dari Google Sheets. ' +
+                        'Tanggal Google Drive belum dapat dibaca.',
+                        '#b36b00'
+                    );
+                }
+
+                if (manual) {
+                    alert(
+                        metadataLoaded
+                            ? 'Data berhasil dimuat dari Google Sheets!\n\n' +
+                              'Tanggal terakhir modifikasi Google Drive: ' +
+                              lastProcessDate
+                            : 'Data berhasil dimuat dari Google Sheets, tetapi tanggal Google Drive belum dapat dibaca.'
+                    );
+                }
+            });
         })
         .catch(err => {
             let msg = err.message || 'Tidak diketahui';
@@ -2329,6 +2450,9 @@ window.onload = () => {
     if (gsheetCsvUrl) {
         loadFromGSheet(false);
     }
+
+    // Jika data tersimpan sudah ada, tetap sinkronkan tanggal dengan Google Drive.
+    loadDriveLastModified();
 };
 </script>
 </body>
